@@ -1,7 +1,5 @@
 streamlit
 pandas
-pgeocode
 openpyxl
 xlsxwriter
 requests
-numpy
