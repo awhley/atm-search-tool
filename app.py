@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
-import pgeocode
+import requests
 import math
 import numpy as np
 from io import BytesIO
+import time
 
 # Configure the Streamlit page
 st.set_page_config(
@@ -16,8 +17,48 @@ class ATMSearchTool:
     def __init__(self):
         self.df = None
         self.invalid_zips_df = None
-        self.nomi = pgeocode.Nominatim('us')  # US zip codes
-        self.dist_calc = pgeocode.GeoDistance('us')
+        self.zip_coords_cache = {}
+        
+    def get_zip_coordinates(self, zip_code):
+        """Get coordinates for a zip code using free API"""
+        if zip_code in self.zip_coords_cache:
+            return self.zip_coords_cache[zip_code]
+        
+        try:
+            # Use free zip code API
+            url = f"https://api.zippopotam.us/us/{zip_code}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                lat = float(data['places'][0]['latitude'])
+                lon = float(data['places'][0]['longitude'])
+                coords = {'latitude': lat, 'longitude': lon}
+                self.zip_coords_cache[zip_code] = coords
+                return coords
+            else:
+                self.zip_coords_cache[zip_code] = {'latitude': None, 'longitude': None}
+                return {'latitude': None, 'longitude': None}
+                
+        except Exception as e:
+            self.zip_coords_cache[zip_code] = {'latitude': None, 'longitude': None}
+            return {'latitude': None, 'longitude': None}
+    
+    def haversine_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance between two points using Haversine formula"""
+        # Convert decimal degrees to radians
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        
+        # Radius of earth in miles
+        r = 3956
+        
+        return c * r
         
     def load_excel_file(self, uploaded_file):
         """Load and process the Excel file"""
@@ -207,24 +248,14 @@ class ATMSearchTool:
         failed_zips = []
         
         for i, zip_code in enumerate(unique_zips):
-            try:
-                location_data = self.nomi.query_postal_code(zip_code)
-                if not pd.isna(location_data.latitude):
-                    zip_coords[zip_code] = {
-                        'latitude': location_data.latitude,
-                        'longitude': location_data.longitude
-                    }
-                else:
-                    zip_coords[zip_code] = {
-                        'latitude': None,
-                        'longitude': None
-                    }
-                    failed_zips.append(zip_code)
-            except:
-                zip_coords[zip_code] = {
-                    'latitude': None,
-                    'longitude': None
-                }
+            # Add small delay to be respectful to the API
+            if i > 0 and i % 10 == 0:
+                time.sleep(1)
+            
+            coords = self.get_zip_coordinates(zip_code)
+            zip_coords[zip_code] = coords
+            
+            if coords['latitude'] is None:
                 failed_zips.append(zip_code)
             
             progress_bar.progress((i + 1) / len(unique_zips))
@@ -242,23 +273,25 @@ class ATMSearchTool:
         """Search for ATMs within specified radius of a zip code"""
         try:
             # Get coordinates for search zip code
-            search_location = self.nomi.query_postal_code(search_zip)
+            search_coords = self.get_zip_coordinates(search_zip)
             
-            if pd.isna(search_location.latitude):
+            if search_coords['latitude'] is None:
                 st.error(f"Could not find coordinates for zip code: {search_zip}")
                 return pd.DataFrame()
             
-            search_lat = search_location.latitude
-            search_lon = search_location.longitude
+            search_lat = search_coords['latitude']
+            search_lon = search_coords['longitude']
             
             # Calculate distances for all ATMs
             distances = []
             
             for _, row in self.df.iterrows():
                 if pd.notna(row['latitude']) and pd.notna(row['longitude']):
-                    # Calculate distance using pgeocode
-                    distance_km = self.dist_calc.query_postal_code(search_zip, row['zip'])
-                    distance_miles = distance_km * 0.621371 if not pd.isna(distance_km) else float('inf')
+                    # Calculate distance using Haversine formula
+                    distance_miles = self.haversine_distance(
+                        search_lat, search_lon, 
+                        row['latitude'], row['longitude']
+                    )
                     distances.append(distance_miles)
                 else:
                     distances.append(float('inf'))
@@ -388,16 +421,6 @@ def main():
             else:
                 st.metric("Invalid Zip Records", 0)
         
-        # Show column information
-        with st.expander("📋 Available Data Columns"):
-            available_cols = [col for col in search_tool.df.columns if col not in ['working_zip', 'cleaned_zip', 'latitude', 'longitude', 'distance_miles']]
-            col_info = pd.DataFrame({
-                'Column': available_cols,
-                'Non-Empty Values': [search_tool.df[col].notna().sum() for col in available_cols],
-                'Data Type': [str(search_tool.df[col].dtype) for col in available_cols]
-            })
-            st.dataframe(col_info, use_container_width=True)
-        
         # Search interface
         st.subheader("🔍 Search ATMs")
         
@@ -452,10 +475,6 @@ def main():
                             hide_index=True
                         )
                         
-                        # Additional details in expandable section
-                        with st.expander("📋 All Available Data"):
-                            st.dataframe(results, use_container_width=True, hide_index=True)
-                        
                         # Download button
                         excel_data = search_tool.export_results(results)
                         st.download_button(
@@ -467,23 +486,6 @@ def main():
                         
                         # Store results in session state for map display
                         st.session_state.search_results = results
-                        
-                        # Summary statistics
-                        st.subheader("📈 Search Summary")
-                        summary_col1, summary_col2, summary_col3 = st.columns(3)
-                        
-                        with summary_col1:
-                            avg_distance = results['distance_miles'].mean()
-                            st.metric("Average Distance", f"{avg_distance:.2f} miles")
-                        
-                        with summary_col2:
-                            closest_distance = results['distance_miles'].min()
-                            st.metric("Closest ATM", f"{closest_distance:.2f} miles")
-                        
-                        with summary_col3:
-                            if 'make' in results.columns:
-                                top_make = results['make'].mode().iloc[0] if not results['make'].mode().empty else "N/A"
-                                st.metric("Most Common Make", top_make)
                         
                     else:
                         st.warning(f"No ATMs found within {radius_miles} miles of {search_zip}")
@@ -523,16 +525,6 @@ def main():
         - **St**: State abbreviation
         - **Zip Short**: 5-digit zip code (preferred) or **Zip**: zip code
         - And other optional columns like Make, Model, etc.
-        """)
-        
-        st.subheader("How It Works")
-        st.markdown("""
-        1. **Upload** your Excel file containing ATM data
-        2. **Review** any invalid zip code records (downloadable)
-        3. **Enter** a zip code you want to search around
-        4. **Select** the search radius (5-50 miles)
-        5. **Get** a list of all ATMs within that radius
-        6. **Download** the results as an Excel file
         """)
 
 if __name__ == "__main__":
